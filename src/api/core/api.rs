@@ -17,7 +17,7 @@ macro_rules! define_il2cpp_functions {
             $(
                 $opt_name:ident, $opt_type_name:ident, $opt_symbol:literal,
                 ($($opt_arg_name:ident : $opt_arg_type:ty),*),
-                $opt_ret_type:ty
+                $opt_ret_type:ty => $opt_fallback:expr
             );* $(;)?
         }
     ) => {
@@ -45,8 +45,10 @@ macro_rules! define_il2cpp_functions {
         /// Initializes the IL2CPP functions using the provided loader.
         ///
         /// Required symbols must all resolve or `load` returns `Err`.
-        /// Optional symbols that cannot be resolved are silently set to `None`;
-        /// calling their wrappers returns [`Default::default()`] with a warning log.
+        /// Optional symbols that cannot be resolved are stored as `None`;
+        /// calling their wrappers runs the hand-written fallback provided for
+        /// each optional entry (with a warning log) so that out-parameters are
+        /// always left in a well-defined state.
         pub fn load(loader: impl Fn(&str) -> *mut c_void) -> Result<usize, Vec<&'static str>> {
             let mut missing = Vec::new();
             let mut count = 0usize;
@@ -105,7 +107,9 @@ macro_rules! define_il2cpp_functions {
             }
         )*
 
-        // Optional symbol wrappers — graceful fallback if not loaded.
+        // Optional symbol wrappers — run the per-function hand-written
+        // fallback when the symbol is missing, so the call's contract (e.g.
+        // out-parameters being written) is still preserved.
         $(
             #[inline(always)]
             pub unsafe fn $opt_name($($opt_arg_name: $opt_arg_type),*) -> $opt_ret_type {
@@ -116,7 +120,7 @@ macro_rules! define_il2cpp_functions {
                             "IL2CPP optional symbol not loaded: {}",
                             $opt_symbol
                         ));
-                        Default::default()
+                        $opt_fallback
                     }
                 }
             }
@@ -365,11 +369,20 @@ define_il2cpp_functions! {
     }
     optional {
     // Thread operations — removed from required in Unity 6+ (il2cpp_thread_get_all_attached_threads)
-    thread_get_all_attached_threads, Il2CppThreadGetAllAttachedThreads, "il2cpp_thread_get_all_attached_threads", (size: *mut usize), *mut *mut c_void;
+    // Fallback: report zero attached threads (null array, *size = 0) so callers
+    // never read an uninitialized out-parameter or a dangling array pointer.
+    thread_get_all_attached_threads, Il2CppThreadGetAllAttachedThreads, "il2cpp_thread_get_all_attached_threads", (size: *mut usize), *mut *mut c_void => {
+        if !size.is_null() { *size = 0; }
+        std::ptr::null_mut()
+    };
 
     // Testing operations — removed from required in Unity 6+ (il2cpp_class_get_bitmap_size, il2cpp_class_get_bitmap)
-    class_get_bitmap_size, Il2CppClassGetBitmapSize, "il2cpp_class_get_bitmap_size", (klass: *mut c_void), usize;
-    class_get_bitmap, Il2CppClassGetBitmap, "il2cpp_class_get_bitmap", (klass: *mut c_void, bitmap: *mut usize), ();
+    // Fallbacks: report an empty/zero bitmap so the out-parameter is always
+    // written and downstream consumers treat the class as having no GC bitmap.
+    class_get_bitmap_size, Il2CppClassGetBitmapSize, "il2cpp_class_get_bitmap_size", (klass: *mut c_void), usize => 0;
+    class_get_bitmap, Il2CppClassGetBitmap, "il2cpp_class_get_bitmap", (klass: *mut c_void, bitmap: *mut usize), () => {
+        if !bitmap.is_null() { *bitmap = 0; }
+    };
     }
 }
 
