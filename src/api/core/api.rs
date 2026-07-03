@@ -6,38 +6,54 @@ use std::mem::transmute;
 
 macro_rules! define_il2cpp_functions {
     (
-        $(
-            $name:ident, $type_name:ident, $symbol:literal,
-            ($($arg_name:ident : $arg_type:ty),*),
-            $ret_type:ty
-        );* $(;)?
+        required {
+            $(
+                $name:ident, $type_name:ident, $symbol:literal,
+                ($($arg_name:ident : $arg_type:ty),*),
+                $ret_type:ty
+            );* $(;)?
+        }
+        optional {
+            $(
+                $opt_name:ident, $opt_type_name:ident, $opt_symbol:literal,
+                ($($opt_arg_name:ident : $opt_arg_type:ty),*),
+                $opt_ret_type:ty => $opt_fallback:expr
+            );* $(;)?
+        }
     ) => {
-        // Typedefs
+        // Typedefs (both required and optional)
         $(
             pub type $type_name = unsafe extern "C" fn($($arg_name: $arg_type),*) -> $ret_type;
         )*
+        $(
+            pub type $opt_type_name = unsafe extern "C" fn($($opt_arg_name: $opt_arg_type),*) -> $opt_ret_type;
+        )*
 
-        /// Structure holding function pointers to IL2CPP API functions
+        /// Structure holding function pointers to IL2CPP API functions.
         ///
-        /// This struct is initialized once and holds the raw function pointers
-        /// loaded dynamically.
+        /// Required fields are always present after `load` succeeds.
+        /// Optional fields may be `None` on newer Unity versions that no
+        /// longer export certain symbols.
         #[derive(Clone)]
         pub struct Il2CppFunctions {
-            $(pub $name: $type_name),*
+            $(pub $name: $type_name,)*
+            $(pub $opt_name: Option<$opt_type_name>,)*
         }
 
         static FUNCTIONS: OnceCell<Il2CppFunctions> = OnceCell::new();
 
-        /// Initializes the IL2CPP functions using the provided loader
+        /// Initializes the IL2CPP functions using the provided loader.
         ///
-        /// # Arguments
-        /// * `loader` - A closure that takes a symbol name and returns a pointer to it
-        ///
-        /// # Errors
-        /// Returns the list of missing symbol names if any required export could not be resolved.
+        /// Required symbols must all resolve or `load` returns `Err`.
+        /// Optional symbols that cannot be resolved are stored as `None`;
+        /// calling their wrappers runs the hand-written fallback provided for
+        /// each optional entry (with a warning log) so that out-parameters are
+        /// always left in a well-defined state.
         pub fn load(loader: impl Fn(&str) -> *mut c_void) -> Result<usize, Vec<&'static str>> {
             let mut missing = Vec::new();
             let mut count = 0usize;
+
+            // Required symbols — any missing is a hard error.
             $(
                 let $name = {
                     let ptr = loader($symbol);
@@ -51,14 +67,26 @@ macro_rules! define_il2cpp_functions {
                 };
             )*
 
+            // Optional symbols — missing is OK, stored as None.
+            $(
+                let $opt_name = {
+                    let ptr = loader($opt_symbol);
+                    if ptr.is_null() {
+                        None
+                    } else {
+                        count += 1;
+                        Some(unsafe { transmute::<*mut c_void, $opt_type_name>(ptr) })
+                    }
+                };
+            )*
+
             if !missing.is_empty() {
                 return Err(missing);
             }
 
             let funcs = Il2CppFunctions {
-                $(
-                    $name: $name.expect("IL2CPP symbol checked above")
-                ),*
+                $($name: $name.expect("IL2CPP required symbol checked above"),)*
+                $($opt_name: $opt_name,)*
             };
             if FUNCTIONS.set(funcs).is_err() {
                 logger::warning("Il2Cpp functions already initialized!");
@@ -71,17 +99,37 @@ macro_rules! define_il2cpp_functions {
             FUNCTIONS.get().expect("Il2Cpp functions not initialized!")
         }
 
-        // Static Wrappers
+        // Required symbol wrappers — direct call.
         $(
             #[inline(always)]
             pub unsafe fn $name($($arg_name: $arg_type),*) -> $ret_type {
                 (get_functions().$name)($($arg_name),*)
             }
         )*
+
+        // Optional symbol wrappers — run the per-function hand-written
+        // fallback when the symbol is missing, so the call's contract (e.g.
+        // out-parameters being written) is still preserved.
+        $(
+            #[inline(always)]
+            pub unsafe fn $opt_name($($opt_arg_name: $opt_arg_type),*) -> $opt_ret_type {
+                match get_functions().$opt_name {
+                    Some(f) => f($($opt_arg_name),*),
+                    None => {
+                        logger::warning(&format!(
+                            "IL2CPP optional symbol not loaded: {}",
+                            $opt_symbol
+                        ));
+                        $opt_fallback
+                    }
+                }
+            }
+        )*
     };
 }
 
 define_il2cpp_functions! {
+    required {
     // Initialization and Configuration
     init, Il2CppInit, "il2cpp_init", (domain_name: *const c_char), ();
     init_utf16, Il2CppInitUtf16, "il2cpp_init_utf16", (domain_name: *const u16), ();
@@ -257,7 +305,6 @@ define_il2cpp_functions! {
     // Thread operations
     thread_attach, Il2CppThreadAttach, "il2cpp_thread_attach", (domain: *mut c_void), *mut c_void;
     thread_detach, Il2CppThreadDetach, "il2cpp_thread_detach", (thread: *mut c_void), ();
-    thread_get_all_attached_threads, Il2CppThreadGetAllAttachedThreads, "il2cpp_thread_get_all_attached_threads", (size: *mut usize), *mut *mut c_void;
     thread_current, Il2CppThreadCurrent, "il2cpp_thread_current", (), *mut c_void;
     is_vm_thread, Il2CppIsVmThread, "il2cpp_is_vm_thread", (thread: *mut c_void), bool;
 
@@ -319,10 +366,24 @@ define_il2cpp_functions! {
     // Stats operations
     stats_dump_to_file, Il2CppStatsDumpToFile, "il2cpp_stats_dump_to_file", (path: *const c_char), bool;
     stats_get_value, Il2CppStatsGetValue, "il2cpp_stats_get_value", (stat: u32), u64;
+    }
+    optional {
+    // Thread operations — removed from required in Unity 6+ (il2cpp_thread_get_all_attached_threads)
+    // Fallback: report zero attached threads (null array, *size = 0) so callers
+    // never read an uninitialized out-parameter or a dangling array pointer.
+    thread_get_all_attached_threads, Il2CppThreadGetAllAttachedThreads, "il2cpp_thread_get_all_attached_threads", (size: *mut usize), *mut *mut c_void => {
+        if !size.is_null() { *size = 0; }
+        std::ptr::null_mut()
+    };
 
-    // Testing operations
-    class_get_bitmap_size, Il2CppClassGetBitmapSize, "il2cpp_class_get_bitmap_size", (klass: *mut c_void), usize;
-    class_get_bitmap, Il2CppClassGetBitmap, "il2cpp_class_get_bitmap", (klass: *mut c_void, bitmap: *mut usize), ()
+    // Testing operations — removed from required in Unity 6+ (il2cpp_class_get_bitmap_size, il2cpp_class_get_bitmap)
+    // Fallbacks: report an empty/zero bitmap so the out-parameter is always
+    // written and downstream consumers treat the class as having no GC bitmap.
+    class_get_bitmap_size, Il2CppClassGetBitmapSize, "il2cpp_class_get_bitmap_size", (klass: *mut c_void), usize => 0;
+    class_get_bitmap, Il2CppClassGetBitmap, "il2cpp_class_get_bitmap", (klass: *mut c_void, bitmap: *mut usize), () => {
+        if !bitmap.is_null() { *bitmap = 0; }
+    };
+    }
 }
 
 pub const FIELD_ATTRIBUTE_FIELD_ACCESS_MASK: i32 = 0x0007;
